@@ -555,54 +555,92 @@ function trancateText(text: string, maxWidth: number, widths: number[]): string 
     return truncatedText;
 }
 
+// Helper function for interpolation
+function interpolate(startValue: number, endValue: number, factor: number): number {
+    factor = Math.max(0, Math.min(1, factor)); // Clamp factor to [0, 1]
+    return startValue + (endValue - startValue) * factor;
+}
+
 function getCommitColor(commit: string, timestamp: number): { lightColor: string, darkColor: string } {
-    let hash = 0;
+    // --- Constants for Age and Color ---
+    const VERY_RECENT_DAYS = 14;
+    const MODERATELY_OLD_DAYS = 90;
+
+    // HSL for "Very Recent" Commits
+    const H_RECENT = 45; // Warm color (e.g., orange/yellow)
+    const S_RECENT_DARK = 85;
+    const L_RECENT_DARK = 30; // Lighter for dark themes to make annotation pop
+    const S_RECENT_LIGHT = 85;
+    const L_RECENT_LIGHT = 80; // Darker for light themes to make annotation pop
+
+    // HSL for "Old" Commits (using commit hash for hue)
+    const S_OLD_DARK = 20;
+    const L_OLD_DARK = 15; // Original dark theme lightness
+    const S_OLD_LIGHT = 25;
+    const L_OLD_LIGHT = 95; // Original light theme lightness
+
+    // --- Calculate Commit Age and Hash ---
+    let hashSum = 0;
     for (let i = 0; i < commit.length; i++) {
-        hash = commit.charCodeAt(i) + ((hash << 5) - hash);
+        hashSum = commit.charCodeAt(i) + ((hashSum << 5) - hashSum);
     }
-    const h = hash % 360;
+    const h_hash = hashSum % 360; // Hue from commit hash
 
-    const SECONDS_IN_A_DAY = 86400; // 24 * 60 * 60
-    const NOW_IN_SECONDS = Date.now() / 1000;
-    const commitAgeInDays = (NOW_IN_SECONDS - timestamp) / SECONDS_IN_A_DAY;
+    const nowInSeconds = Date.now() / 1000; // Current time in seconds
+    // Ensure timestamp is not in the future, which can happen with local clock issues or bad data
+    const validTimestamp = Math.min(timestamp, nowInSeconds);
+    const ageInSeconds = nowInSeconds - validTimestamp;
+    const ageInDays = ageInSeconds / (60 * 60 * 24);
 
-    const RECENT_DAYS = 7;
-    const OLD_DAYS = 90;
-    const MAX_AGE_DAYS = 180; // Maximum age for interpolation
+    let h_final_dark, s_final_dark, l_final_dark;
+    let h_final_light, s_final_light, l_final_light;
 
-    let darkSaturation, lightSaturation;
-    let darkLightness = 15; // Default lightness for dark theme
-    let lightLightness = 95; // Default lightness for light theme
+    if (ageInDays < VERY_RECENT_DAYS) {
+        h_final_dark = H_RECENT;
+        s_final_dark = S_RECENT_DARK;
+        l_final_dark = L_RECENT_DARK;
 
-    if (commitAgeInDays <= RECENT_DAYS) {
-        darkSaturation = 70; // Higher saturation for recent commits (dark theme)
-        lightSaturation = 80; // Higher saturation for recent commits (light theme)
-        // Optional: Adjust lightness for very recent items if they need to pop more
-        // darkLightness = 20;
-        // lightLightness = 90;
-    } else if (commitAgeInDays >= OLD_DAYS) {
-        darkSaturation = 15; // Lower saturation for old commits (dark theme)
-        lightSaturation = 20; // Lower saturation for old commits (light theme)
+        h_final_light = H_RECENT;
+        s_final_light = S_RECENT_LIGHT;
+        l_final_light = L_RECENT_LIGHT;
+    } else if (ageInDays >= MODERATELY_OLD_DAYS) {
+        h_final_dark = h_hash;
+        s_final_dark = S_OLD_DARK;
+        l_final_dark = L_OLD_DARK;
+
+        h_final_light = h_hash;
+        s_final_light = S_OLD_LIGHT;
+        l_final_light = L_OLD_LIGHT;
     } else {
-        // Interpolate saturation between RECENT_DAYS and OLD_DAYS
-        // Calculate the position in the interpolation range (0 for RECENT_DAYS, 1 for OLD_DAYS)
-        const factor = (commitAgeInDays - RECENT_DAYS) / (OLD_DAYS - RECENT_DAYS);
-        darkSaturation = 70 - (70 - 15) * factor; // Interpolate from 70 down to 15
-        lightSaturation = 80 - (80 - 20) * factor; // Interpolate from 80 down to 20
+        // Interpolation zone: VERY_RECENT_DAYS to MODERATELY_OLD_DAYS
+        const factor = (ageInDays - VERY_RECENT_DAYS) / (MODERATELY_OLD_DAYS - VERY_RECENT_DAYS);
+
+        // Interpolate Hue from H_RECENT to h_hash
+        // Handle hue interpolation carefully around the 360-degree circle
+        let hueDiff = h_hash - H_RECENT;
+        if (Math.abs(hueDiff) > 180) { // If distance is > 180, go the other way
+            hueDiff = hueDiff > 0 ? hueDiff - 360 : hueDiff + 360;
+        }
+        const interpolatedHue = (H_RECENT + hueDiff * factor + 360) % 360;
+
+        h_final_dark = interpolatedHue;
+        h_final_light = interpolatedHue;
+
+        s_final_dark = interpolate(S_RECENT_DARK, S_OLD_DARK, factor);
+        l_final_dark = interpolate(L_RECENT_DARK, L_OLD_DARK, factor);
+
+        s_final_light = interpolate(S_RECENT_LIGHT, S_OLD_LIGHT, factor);
+        l_final_light = interpolate(L_RECENT_LIGHT, L_OLD_LIGHT, factor);
     }
 
-    // For commits older than MAX_AGE_DAYS, clamp to the 'old' style
-    if (commitAgeInDays > MAX_AGE_DAYS) {
-        darkSaturation = 15;
-        lightSaturation = 20;
-    }
+    // Ensure final S and L values are within the 0-100 range
+    s_final_dark = Math.max(0, Math.min(100, s_final_dark));
+    l_final_dark = Math.max(0, Math.min(100, l_final_dark));
+    s_final_light = Math.max(0, Math.min(100, s_final_light));
+    l_final_light = Math.max(0, Math.min(100, l_final_light));
 
-    // Ensure saturation values are within the valid HSL range (0-100)
-    darkSaturation = Math.max(0, Math.min(100, darkSaturation));
-    lightSaturation = Math.max(0, Math.min(100, lightSaturation));
-
-    const darkColor = `hsl(${h}, ${darkSaturation.toFixed(0)}%, ${darkLightness}%)`;
-    const lightColor = `hsl(${h}, ${lightSaturation.toFixed(0)}%, ${lightLightness}%)`;
+    const darkColor = `hsl(${h_final_dark.toFixed(0)}, ${s_final_dark.toFixed(0)}%, ${l_final_dark.toFixed(0)}%)`;
+    const lightColor = `hsl(${h_final_light.toFixed(0)}, ${s_final_light.toFixed(0)}%, ${l_final_light.toFixed(0)}%)`;
 
     return { lightColor, darkColor };
 }
