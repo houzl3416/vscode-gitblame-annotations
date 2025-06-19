@@ -207,10 +207,91 @@ async function showDecorations(editors: vscode.TextEditor[], reload: boolean = f
 
     try {
         // Blames
-        const blames = await getBlames(path.dirname(document.fileName), document.fileName);
-        for (let i = blames.length; i < document.lineCount; i++) {
-            blames.push(buildUncommitBlame(i + 1));
+        let blames = await getBlames(path.dirname(document.fileName), document.fileName);
+
+        // --- Calculate and attach relativeAgeInFile ---
+        let minTimestamp = Infinity;
+        let maxTimestamp = 0;
+        let hasCommits = false;
+
+        for (const blame of blames) {
+            if (blame.commited && blame.timestamp > 0) {
+                hasCommits = true;
+                if (blame.timestamp < minTimestamp) {
+                    minTimestamp = blame.timestamp;
+                }
+                if (blame.timestamp > maxTimestamp) {
+                    maxTimestamp = blame.timestamp;
+                }
+            }
         }
+
+        if (hasCommits) {
+            for (const blame of blames) {
+                if (blame.commited && blame.timestamp > 0) {
+                    if (minTimestamp === maxTimestamp) {
+                        blame.relativeAgeInFile = 1.0; // All are effectively the 'newest' (or 'only')
+                    } else {
+                        blame.relativeAgeInFile = (blame.timestamp - minTimestamp) / (maxTimestamp - minTimestamp);
+                    }
+                } else {
+                    blame.relativeAgeInFile = undefined;
+                }
+            }
+        } else {
+            for (const blame of blames) {
+                blame.relativeAgeInFile = undefined;
+            }
+        }
+        // --- End of relativeAgeInFile calculation ---
+
+        // Fill lines not covered by git blame (e.g. new, uncommitted lines)
+        // These will also get relativeAgeInFile = undefined by the logic above if processed
+        // after being added, or explicitly if added before the loop.
+        // For simplicity, let's ensure they are added before the relativeAge calculation loop.
+        // This part is tricky because blames from getBlames might not cover all lines.
+        // Let's refine: create a full list of blames first, then calculate relative age.
+
+        const allBlames: Blame[] = new Array(document.lineCount);
+        blames.forEach(b => { // Populate from actual blames
+            if (b.line > 0 && b.line <= document.lineCount) {
+                 // git blame lines are 1-indexed, array is 0-indexed
+                allBlames[b.line -1] = b;
+            }
+        });
+
+        for (let i = 0; i < document.lineCount; i++) {
+            if (!allBlames[i]) { // If no blame info for this line (e.g. uncommitted)
+                allBlames[i] = buildUncommitBlame(i + 1);
+            }
+        }
+        blames = allBlames; // Replace original blames with the full list
+
+        // Recalculate min/max and relative ages on the *complete* blames array
+        minTimestamp = Infinity;
+        maxTimestamp = 0;
+        hasCommits = false;
+        for (const blame of blames) {
+            if (blame.commited && blame.timestamp > 0) {
+                hasCommits = true;
+                if (blame.timestamp < minTimestamp) minTimestamp = blame.timestamp;
+                if (blame.timestamp > maxTimestamp) maxTimestamp = blame.timestamp;
+            }
+        }
+
+        for (const blame of blames) {
+            if (blame.commited && blame.timestamp > 0 && hasCommits) {
+                if (minTimestamp === maxTimestamp) {
+                    blame.relativeAgeInFile = 1.0;
+                } else {
+                    blame.relativeAgeInFile = (blame.timestamp - minTimestamp) / (maxTimestamp - minTimestamp);
+                }
+            } else {
+                blame.relativeAgeInFile = undefined; // Ensure uncommitted lines have this as undefined
+            }
+        }
+        // --- End of refined relativeAgeInFile calculation ---
+
 
         // Decorations
         if (!decorations.decorationType) {
@@ -612,95 +693,56 @@ function interpolate(startValue: number, endValue: number, factor: number): numb
     return startValue + (endValue - startValue) * factor;
 }
 
-function getCommitColor(commit: string, timestamp: number): CommitColorInfo {
-    // --- Constants ---
-    const VERY_RECENT_DAYS = 14;
-    const RECENT_TO_MID_AGE_DAYS = 60; // 14 to 60 days
-    const MID_AGE_TO_OLD_DAYS = 180;   // 60 to 180 days
-
-    const H_RECENT = 45;
-    const BASE_HUES_OLDER = [200, 120, 280, 30, 300, 240, 60]; // Added more hues for variety
-
-    // --- Calculate Age ---
-    const nowInSeconds = Date.now() / 1000;
-    const validTimestamp = Math.min(timestamp, nowInSeconds);
-    const ageInSeconds = nowInSeconds - validTimestamp;
-    const ageInDays = ageInSeconds / (60 * 60 * 24);
-
-    let h_dark: number, s_dark: number, l_dark: number;
-    let h_light: number, s_light: number, l_light: number;
-
-    if (ageInDays < VERY_RECENT_DAYS) {
-        h_dark = H_RECENT;
-        s_dark = 85;
-        l_dark = 30; // Lighter for dark theme
-        h_light = H_RECENT;
-        s_light = 85;
-        l_light = 80; // Darker for light theme
-    } else {
-        const commitHash = hashCode(commit);
-        const selectedBaseHue = BASE_HUES_OLDER[Math.abs(commitHash) % BASE_HUES_OLDER.length];
-
-        h_dark = selectedBaseHue; // Default to selectedBaseHue for older commits
-        h_light = selectedBaseHue; // Will be adjusted if in the first transition phase (14-60 days)
-
-        if (ageInDays < RECENT_TO_MID_AGE_DAYS) { // 14 to 60 days
-            const factor = (ageInDays - VERY_RECENT_DAYS) / (RECENT_TO_MID_AGE_DAYS - VERY_RECENT_DAYS);
-
-            // Interpolate Hue from H_RECENT towards selectedBaseHue
-            let hueDiff = selectedBaseHue - H_RECENT;
-            if (Math.abs(hueDiff) > 180) { hueDiff = hueDiff > 0 ? hueDiff - 360 : hueDiff + 360; }
-            const interpolatedHue = (H_RECENT + hueDiff * factor); // Hue can be negative here, will be fixed by % 360 later
-            h_dark = interpolatedHue;
-            h_light = interpolatedHue;
-
-            // Interpolate S, L from "Very Recent" values to "Just Older" target values
-            // Dark Theme: From (H_RECENT, S85, L30) to (selectedBaseHue, S70, L25)
-            s_dark = interpolate(85, 70, factor);
-            l_dark = interpolate(30, 25, factor);
-            // Light Theme: From (H_RECENT, S85, L80) to (selectedBaseHue, S70, L85)
-            s_light = interpolate(85, 70, factor);
-            l_light = interpolate(80, 85, factor);
-
-        } else if (ageInDays < MID_AGE_TO_OLD_DAYS) { // 60 to 180 days
-            const factor = (ageInDays - RECENT_TO_MID_AGE_DAYS) / (MID_AGE_TO_OLD_DAYS - RECENT_TO_MID_AGE_DAYS);
-            // Hue is already selectedBaseHue
-            // Dark Theme: From (S70, L25) to (S50, L20)
-            s_dark = interpolate(70, 50, factor);
-            l_dark = interpolate(25, 20, factor);
-            // Light Theme: From (S70, L85) to (S50, L90)
-            s_light = interpolate(70, 50, factor);
-            l_light = interpolate(85, 90, factor);
-        } else { // > 180 days
-            // Hue is selectedBaseHue
-            // Dark Theme: (S30, L15)
-            s_dark = 30;
-            l_dark = 15;
-            // Light Theme: (S30, L95)
-            s_light = 30;
-            l_light = 95;
+function interpolateHue(h1: number, h2: number, factor: number): number {
+    const diff = Math.abs(h1 - h2);
+    if (diff > 180) { // Interpolate the shorter way
+        if (h1 > h2) {
+            h1 -= 360;
+        } else {
+            h2 -= 360;
         }
     }
+    let hue = h1 + (h2 - h1) * factor;
+    if (hue < 0) hue += 360;
+    return Math.round(hue % 360);
+}
 
-    // Normalize and Clamp S, L, H
-    s_dark = Math.max(0, Math.min(100, s_dark));
-    l_dark = Math.max(0, Math.min(100, l_dark));
-    s_light = Math.max(0, Math.min(100, s_light));
-    l_light = Math.max(0, Math.min(100, l_light));
+const GRADIENT_CONFIG = {
+    NEWEST_DARK: { h: 45, s: 90, l: 40 },
+    NEWEST_LIGHT: { h: 45, s: 90, l: 75 },
+    OLDEST_DARK: { h: 240, s: 20, l: 20 },
+    OLDEST_LIGHT: { h: 240, s: 30, l: 90 },
+    UNCOMMITTED_DARK_BG: "hsl(0, 0%, 22%)", // Slightly off-black for dark themes
+    UNCOMMITTED_LIGHT_BG: "hsl(0, 0%, 92%)", // Slightly off-white for light themes
+};
 
-    h_dark = (h_dark % 360 + 360) % 360;
-    h_light = (h_light % 360 + 360) % 360;
+function getCommitColor(commit: string, relativeAgeInFile?: number): CommitColorInfo {
+    let finalDarkBgColor: string;
+    let finalLightBgColor: string;
 
+    if (relativeAgeInFile === undefined || relativeAgeInFile < 0 || relativeAgeInFile > 1) {
+        // Handle uncommitted or lines where relative age is not applicable
+        finalDarkBgColor = GRADIENT_CONFIG.UNCOMMITTED_DARK_BG;
+        finalLightBgColor = GRADIENT_CONFIG.UNCOMMITTED_LIGHT_BG;
+    } else {
+        // Interpolate for Dark Theme
+        const h_dark = interpolateHue(GRADIENT_CONFIG.OLDEST_DARK.h, GRADIENT_CONFIG.NEWEST_DARK.h, relativeAgeInFile);
+        const s_dark = interpolate(GRADIENT_CONFIG.OLDEST_DARK.s, GRADIENT_CONFIG.NEWEST_DARK.s, relativeAgeInFile);
+        const l_dark = interpolate(GRADIENT_CONFIG.OLDEST_DARK.l, GRADIENT_CONFIG.NEWEST_DARK.l, relativeAgeInFile);
+        finalDarkBgColor = `hsl(${h_dark.toFixed(0)}, ${s_dark.toFixed(0)}%, ${l_dark.toFixed(0)}%)`;
 
-    const finalDarkBgColor = `hsl(${h_dark.toFixed(0)}, ${s_dark.toFixed(0)}%, ${l_dark.toFixed(0)}%)`;
-    const finalLightBgColor = `hsl(${h_light.toFixed(0)}, ${s_light.toFixed(0)}%, ${l_light.toFixed(0)}%)`;
+        // Interpolate for Light Theme
+        const h_light = interpolateHue(GRADIENT_CONFIG.OLDEST_LIGHT.h, GRADIENT_CONFIG.NEWEST_LIGHT.h, relativeAgeInFile);
+        const s_light = interpolate(GRADIENT_CONFIG.OLDEST_LIGHT.s, GRADIENT_CONFIG.NEWEST_LIGHT.s, relativeAgeInFile);
+        const l_light = interpolate(GRADIENT_CONFIG.OLDEST_LIGHT.l, GRADIENT_CONFIG.NEWEST_LIGHT.l, relativeAgeInFile);
+        finalLightBgColor = `hsl(${h_light.toFixed(0)}, ${s_light.toFixed(0)}%, ${l_light.toFixed(0)}%)`;
+    }
 
     const luminanceDarkBg = calculateLuminance(finalDarkBgColor);
     const luminanceLightBg = calculateLuminance(finalLightBgColor);
 
     const darkThemeTextColor = luminanceDarkBg < 0.45 ? '#FFFFFF' : '#000000';
     const lightThemeTextColor = luminanceLightBg < 0.45 ? '#FFFFFF' : '#000000';
-
 
     return {
         lightColor: finalLightBgColor,

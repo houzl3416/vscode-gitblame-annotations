@@ -11,6 +11,7 @@ export interface Blame {
     timestamp: number;
     commited: boolean;
     title: string;
+    relativeAgeInFile?: number; // Relative age of the commit within the context of the current file
 }
 
 export interface CommitBlame {
