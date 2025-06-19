@@ -207,91 +207,52 @@ async function showDecorations(editors: vscode.TextEditor[], reload: boolean = f
 
     try {
         // Blames
-        let blames = await getBlames(path.dirname(document.fileName), document.fileName);
+        const rawBlames = await getBlames(path.dirname(document.fileName), document.fileName);
+        const blames: Blame[] = new Array(document.lineCount);
 
-        // --- Calculate and attach relativeAgeInFile ---
-        let minTimestamp = Infinity;
-        let maxTimestamp = 0;
-        let hasCommits = false;
+        // Initialize all lines as uncommitted and set relativeAgeInFile to undefined
+        for (let i = 0; i < document.lineCount; i++) {
+            blames[i] = buildUncommitBlame(i + 1); // line numbers are 1-indexed
+            blames[i].relativeAgeInFile = undefined;
+        }
 
-        for (const blame of blames) {
-            if (blame.commited && blame.timestamp > 0) {
-                hasCommits = true;
-                if (blame.timestamp < minTimestamp) {
-                    minTimestamp = blame.timestamp;
-                }
-                if (blame.timestamp > maxTimestamp) {
-                    maxTimestamp = blame.timestamp;
-                }
+        // Overlay with actual committed blames
+        for (const committedBlame of rawBlames) {
+            // Ensure line number is within bounds (1 to document.lineCount)
+            if (committedBlame.line > 0 && committedBlame.line <= document.lineCount) {
+                blames[committedBlame.line - 1] = committedBlame;
+                // Keep relativeAgeInFile as undefined for now; it will be calculated below
+                blames[committedBlame.line - 1].relativeAgeInFile = undefined;
             }
         }
 
+        let minTimestamp = Infinity;
+        let maxTimestamp = 0; // Using 0 as timestamps are positive; Infinity could also work.
+        let hasCommits = false;
+
+        // First pass: determine min/max timestamps from committed lines
+        for (const blame of blames) {
+            if (blame.commited && blame.timestamp > 0) {
+                hasCommits = true;
+                minTimestamp = Math.min(minTimestamp, blame.timestamp);
+                maxTimestamp = Math.max(maxTimestamp, blame.timestamp);
+            }
+        }
+
+        // Second pass: calculate and assign relativeAgeInFile
         if (hasCommits) {
             for (const blame of blames) {
                 if (blame.commited && blame.timestamp > 0) {
                     if (minTimestamp === maxTimestamp) {
-                        blame.relativeAgeInFile = 1.0; // All are effectively the 'newest' (or 'only')
+                        blame.relativeAgeInFile = 1.0; // All committed lines are the same age
                     } else {
                         blame.relativeAgeInFile = (blame.timestamp - minTimestamp) / (maxTimestamp - minTimestamp);
                     }
-                } else {
-                    blame.relativeAgeInFile = undefined;
                 }
-            }
-        } else {
-            for (const blame of blames) {
-                blame.relativeAgeInFile = undefined;
+                // Uncommitted lines or those with timestamp 0 already have relativeAgeInFile = undefined
             }
         }
-        // --- End of relativeAgeInFile calculation ---
-
-        // Fill lines not covered by git blame (e.g. new, uncommitted lines)
-        // These will also get relativeAgeInFile = undefined by the logic above if processed
-        // after being added, or explicitly if added before the loop.
-        // For simplicity, let's ensure they are added before the relativeAge calculation loop.
-        // This part is tricky because blames from getBlames might not cover all lines.
-        // Let's refine: create a full list of blames first, then calculate relative age.
-
-        const allBlames: Blame[] = new Array(document.lineCount);
-        blames.forEach(b => { // Populate from actual blames
-            if (b.line > 0 && b.line <= document.lineCount) {
-                 // git blame lines are 1-indexed, array is 0-indexed
-                allBlames[b.line -1] = b;
-            }
-        });
-
-        for (let i = 0; i < document.lineCount; i++) {
-            if (!allBlames[i]) { // If no blame info for this line (e.g. uncommitted)
-                allBlames[i] = buildUncommitBlame(i + 1);
-            }
-        }
-        blames = allBlames; // Replace original blames with the full list
-
-        // Recalculate min/max and relative ages on the *complete* blames array
-        minTimestamp = Infinity;
-        maxTimestamp = 0;
-        hasCommits = false;
-        for (const blame of blames) {
-            if (blame.commited && blame.timestamp > 0) {
-                hasCommits = true;
-                if (blame.timestamp < minTimestamp) minTimestamp = blame.timestamp;
-                if (blame.timestamp > maxTimestamp) maxTimestamp = blame.timestamp;
-            }
-        }
-
-        for (const blame of blames) {
-            if (blame.commited && blame.timestamp > 0 && hasCommits) {
-                if (minTimestamp === maxTimestamp) {
-                    blame.relativeAgeInFile = 1.0;
-                } else {
-                    blame.relativeAgeInFile = (blame.timestamp - minTimestamp) / (maxTimestamp - minTimestamp);
-                }
-            } else {
-                blame.relativeAgeInFile = undefined; // Ensure uncommitted lines have this as undefined
-            }
-        }
-        // --- End of refined relativeAgeInFile calculation ---
-
+        // 'blames' array now correctly has relativeAgeInFile for committed lines, undefined for others.
 
         // Decorations
         if (!decorations.decorationType) {
@@ -460,10 +421,17 @@ function buildDecorationOptions(blames: Blame[]): vscode.DecorationOptions[] {
     // Update the type of colorsMap to store CommitColorInfo
     const colorsMap = new Map<string, CommitColorInfo>();
     blames.forEach((blame, index) => {
-        let colorInfo = colorsMap.get(blame.commit);
+        const relativeAgeKeyPart = blame.relativeAgeInFile === undefined ?
+            "uncommitted" :
+            blame.relativeAgeInFile.toFixed(3);
+        // Add blame.commited to the cache key
+        const cacheKey = `${blame.commit}_${relativeAgeKeyPart}_${blame.commited}`;
+
+        let colorInfo = colorsMap.get(cacheKey);
         if (!colorInfo) {
-            colorInfo = getCommitColor(blame.commit, blame.timestamp);
-            colorsMap.set(blame.commit, colorInfo);
+            // Pass blame.commited to getCommitColor
+            colorInfo = getCommitColor(blame.commit, blame.relativeAgeInFile, blame.commited);
+            colorsMap.set(cacheKey, colorInfo);
         }
         const range = new vscode.Range(
             new vscode.Position(index, 0),
@@ -708,22 +676,27 @@ function interpolateHue(h1: number, h2: number, factor: number): number {
 }
 
 const GRADIENT_CONFIG = {
-    NEWEST_DARK: { h: 35, s: 100, l: 50 },    // Vibrant, saturated, bright orange
-    NEWEST_LIGHT: { h: 35, s: 95, l: 60 },   // Vibrant, saturated orange, good for light themes
-    OLDEST_DARK: { h: 220, s: 15, l: 15 },    // Very desaturated, very dark, cool blue/slate
-    OLDEST_LIGHT: { h: 220, s: 20, l: 96 },   // Very desaturated, very light, cool blue/gray
-    UNCOMMITTED_DARK_BG: "hsl(0, 0%, 30%)",    // Neutral dark gray
-    UNCOMMITTED_LIGHT_BG: "hsl(0, 0%, 90%)",   // Neutral light gray
+    NEWEST_DARK: { h: 120, s: 100, l: 40 },   // Pure Green, reasonably bright for dark theme
+    NEWEST_LIGHT: { h: 120, s: 100, l: 45 },  // Pure Green, reasonably bright for light theme
+    OLDEST_DARK: { h: 0, s: 100, l: 40 },     // Pure Red, reasonably bright for dark theme
+    OLDEST_LIGHT: { h: 0, s: 100, l: 45 },    // Pure Red, reasonably bright for light theme
+    UNCOMMITTED_DARK_BG: "hsl(0, 0%, 30%)",    // Neutral dark gray (remains unchanged)
+    UNCOMMITTED_LIGHT_BG: "hsl(0, 0%, 90%)",   // Neutral light gray (remains unchanged)
 };
 
-function getCommitColor(commit: string, relativeAgeInFile?: number): CommitColorInfo {
+function getCommitColor(commit: string, relativeAgeInFile?: number, isCommitted?: boolean): CommitColorInfo {
     let finalDarkBgColor: string;
     let finalLightBgColor: string;
+    const LUMINANCE_THRESHOLD = 0.45; // Defined LUMINANCE_THRESHOLD
 
     if (relativeAgeInFile === undefined || relativeAgeInFile < 0 || relativeAgeInFile > 1) {
-        // Handle uncommitted or lines where relative age is not applicable
-        finalDarkBgColor = GRADIENT_CONFIG.UNCOMMITTED_DARK_BG;
-        finalLightBgColor = GRADIENT_CONFIG.UNCOMMITTED_LIGHT_BG;
+        if (isCommitted === true) { // Committed line but relativeAgeInFile is missing/invalid: ERROR CASE
+            finalDarkBgColor = "hsl(300, 100%, 50%)"; // Bright Magenta background for dark theme
+            finalLightBgColor = "hsl(300, 100%, 50%)"; // Bright Magenta background for light theme
+        } else { // Genuinely uncommitted line (isCommitted is false or undefined)
+            finalDarkBgColor = GRADIENT_CONFIG.UNCOMMITTED_DARK_BG;
+            finalLightBgColor = GRADIENT_CONFIG.UNCOMMITTED_LIGHT_BG;
+        }
     } else {
         // Interpolate for Dark Theme
         const h_dark = interpolateHue(GRADIENT_CONFIG.OLDEST_DARK.h, GRADIENT_CONFIG.NEWEST_DARK.h, relativeAgeInFile);
@@ -741,8 +714,8 @@ function getCommitColor(commit: string, relativeAgeInFile?: number): CommitColor
     const luminanceDarkBg = calculateLuminance(finalDarkBgColor);
     const luminanceLightBg = calculateLuminance(finalLightBgColor);
 
-    const darkThemeTextColor = luminanceDarkBg < 0.45 ? '#FFFFFF' : '#000000';
-    const lightThemeTextColor = luminanceLightBg < 0.45 ? '#FFFFFF' : '#000000';
+    const darkThemeTextColor = luminanceDarkBg < LUMINANCE_THRESHOLD ? '#FFFFFF' : '#000000';
+    const lightThemeTextColor = luminanceLightBg < LUMINANCE_THRESHOLD ? '#FFFFFF' : '#000000';
 
     return {
         lightColor: finalLightBgColor,
