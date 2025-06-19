@@ -376,13 +376,13 @@ function buildDecorationOptions(blames: Blame[]): vscode.DecorationOptions[] {
     }
 
     const decorationOptions: vscode.DecorationOptions[] = [];
-    const colorsMap = new Map<string, { lightColor: string, darkColor: string }>();
+    // Update the type of colorsMap to store CommitColorInfo
+    const colorsMap = new Map<string, CommitColorInfo>();
     blames.forEach((blame, index) => {
-        let color = colorsMap.get(blame.commit);
-        if (!color) {
-            // Pass timestamp to getCommitColor
-            color = getCommitColor(blame.commit, blame.timestamp);
-            colorsMap.set(blame.commit, color);
+        let colorInfo = colorsMap.get(blame.commit);
+        if (!colorInfo) {
+            colorInfo = getCommitColor(blame.commit, blame.timestamp);
+            colorsMap.set(blame.commit, colorInfo);
         }
         const range = new vscode.Range(
             new vscode.Position(index, 0),
@@ -393,7 +393,7 @@ function buildDecorationOptions(blames: Blame[]): vscode.DecorationOptions[] {
             renderOptions: {
                 before: {
                     contentText: `\u2007${blame.title}\u2007`,
-                    color: '#666666',
+                    // color property is removed from here, will be set in light/dark sections
                     margin: '0 1ch 0 0',
                     width: `${maxWidth + 2}ch`,
                     fontWeight: 'normal',
@@ -401,12 +401,14 @@ function buildDecorationOptions(blames: Blame[]): vscode.DecorationOptions[] {
                 },
                 light: {
                     before: {
-                        backgroundColor: color.lightColor
+                        backgroundColor: colorInfo.lightColor,
+                        color: colorInfo.lightThemeTextColor // Dynamically set text color
                     }
                 },
                 dark: {
                     before: {
-                        backgroundColor: color.darkColor
+                        backgroundColor: colorInfo.darkColor,
+                        color: colorInfo.darkThemeTextColor // Dynamically set text color
                     }
                 }
             }
@@ -555,94 +557,157 @@ function trancateText(text: string, maxWidth: number, widths: number[]): string 
     return truncatedText;
 }
 
+function hashCode(str: string): number {
+    let hash = 0;
+    for (let i = 0; i < str.length; i++) {
+        const character = str.charCodeAt(i);
+        hash = ((hash << 5) - hash) + character;
+        hash |= 0; // Convert to 32bit integer
+    }
+    return hash;
+}
+
+function parseHsl(hslStr: string): [number, number, number] | null {
+    const match = hslStr.match(/hsl\((\d+),\s*([\d.]+)%,\s*([\d.]+)%\)/);
+    if (match) {
+        return [parseInt(match[1]), parseFloat(match[2]), parseFloat(match[3])];
+    }
+    return null;
+}
+
+function hslToRgb(h: number, s: number, l: number): [number, number, number] {
+    s /= 100;
+    l /= 100;
+    const k = (n: number) => (n + h / 30) % 12;
+    const a = s * Math.min(l, 1 - l);
+    const f = (n: number) =>
+        l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+    return [255 * f(0), 255 * f(8), 255 * f(4)];
+}
+
+function calculateLuminance(hslColorStr: string): number {
+    const hsl = parseHsl(hslColorStr);
+    if (!hsl) return 0;
+
+    const [r, g, b] = hslToRgb(hsl[0], hsl[1], hsl[2]);
+
+    const r_lin = r / 255;
+    const g_lin = g / 255;
+    const b_lin = b / 255;
+
+    return 0.2126 * r_lin + 0.7152 * g_lin + 0.0722 * b_lin;
+}
+
+// Interface for the return type of getCommitColor
+interface CommitColorInfo {
+    lightColor: string;
+    darkColor: string;
+    lightThemeTextColor: string;
+    darkThemeTextColor: string;
+}
+
 // Helper function for interpolation
 function interpolate(startValue: number, endValue: number, factor: number): number {
     factor = Math.max(0, Math.min(1, factor)); // Clamp factor to [0, 1]
     return startValue + (endValue - startValue) * factor;
 }
 
-function getCommitColor(commit: string, timestamp: number): { lightColor: string, darkColor: string } {
-    // --- Constants for Age and Color ---
+function getCommitColor(commit: string, timestamp: number): CommitColorInfo {
+    // --- Constants ---
     const VERY_RECENT_DAYS = 14;
-    const MODERATELY_OLD_DAYS = 90;
+    const RECENT_TO_MID_AGE_DAYS = 60; // 14 to 60 days
+    const MID_AGE_TO_OLD_DAYS = 180;   // 60 to 180 days
 
-    // HSL for "Very Recent" Commits
-    const H_RECENT = 45; // Warm color (e.g., orange/yellow)
-    const S_RECENT_DARK = 85;
-    const L_RECENT_DARK = 30; // Lighter for dark themes to make annotation pop
-    const S_RECENT_LIGHT = 85;
-    const L_RECENT_LIGHT = 80; // Darker for light themes to make annotation pop
+    const H_RECENT = 45;
+    const BASE_HUES_OLDER = [200, 120, 280, 30, 300, 240, 60]; // Added more hues for variety
 
-    // HSL for "Old" Commits (using commit hash for hue)
-    const S_OLD_DARK = 20;
-    const L_OLD_DARK = 15; // Original dark theme lightness
-    const S_OLD_LIGHT = 25;
-    const L_OLD_LIGHT = 95; // Original light theme lightness
-
-    // --- Calculate Commit Age and Hash ---
-    let hashSum = 0;
-    for (let i = 0; i < commit.length; i++) {
-        hashSum = commit.charCodeAt(i) + ((hashSum << 5) - hashSum);
-    }
-    const h_hash = hashSum % 360; // Hue from commit hash
-
-    const nowInSeconds = Date.now() / 1000; // Current time in seconds
-    // Ensure timestamp is not in the future, which can happen with local clock issues or bad data
+    // --- Calculate Age ---
+    const nowInSeconds = Date.now() / 1000;
     const validTimestamp = Math.min(timestamp, nowInSeconds);
     const ageInSeconds = nowInSeconds - validTimestamp;
     const ageInDays = ageInSeconds / (60 * 60 * 24);
 
-    let h_final_dark, s_final_dark, l_final_dark;
-    let h_final_light, s_final_light, l_final_light;
+    let h_dark: number, s_dark: number, l_dark: number;
+    let h_light: number, s_light: number, l_light: number;
 
     if (ageInDays < VERY_RECENT_DAYS) {
-        h_final_dark = H_RECENT;
-        s_final_dark = S_RECENT_DARK;
-        l_final_dark = L_RECENT_DARK;
-
-        h_final_light = H_RECENT;
-        s_final_light = S_RECENT_LIGHT;
-        l_final_light = L_RECENT_LIGHT;
-    } else if (ageInDays >= MODERATELY_OLD_DAYS) {
-        h_final_dark = h_hash;
-        s_final_dark = S_OLD_DARK;
-        l_final_dark = L_OLD_DARK;
-
-        h_final_light = h_hash;
-        s_final_light = S_OLD_LIGHT;
-        l_final_light = L_OLD_LIGHT;
+        h_dark = H_RECENT;
+        s_dark = 85;
+        l_dark = 30; // Lighter for dark theme
+        h_light = H_RECENT;
+        s_light = 85;
+        l_light = 80; // Darker for light theme
     } else {
-        // Interpolation zone: VERY_RECENT_DAYS to MODERATELY_OLD_DAYS
-        const factor = (ageInDays - VERY_RECENT_DAYS) / (MODERATELY_OLD_DAYS - VERY_RECENT_DAYS);
+        const commitHash = hashCode(commit);
+        const selectedBaseHue = BASE_HUES_OLDER[Math.abs(commitHash) % BASE_HUES_OLDER.length];
 
-        // Interpolate Hue from H_RECENT to h_hash
-        // Handle hue interpolation carefully around the 360-degree circle
-        let hueDiff = h_hash - H_RECENT;
-        if (Math.abs(hueDiff) > 180) { // If distance is > 180, go the other way
-            hueDiff = hueDiff > 0 ? hueDiff - 360 : hueDiff + 360;
+        h_dark = selectedBaseHue; // Default to selectedBaseHue for older commits
+        h_light = selectedBaseHue; // Will be adjusted if in the first transition phase (14-60 days)
+
+        if (ageInDays < RECENT_TO_MID_AGE_DAYS) { // 14 to 60 days
+            const factor = (ageInDays - VERY_RECENT_DAYS) / (RECENT_TO_MID_AGE_DAYS - VERY_RECENT_DAYS);
+
+            // Interpolate Hue from H_RECENT towards selectedBaseHue
+            let hueDiff = selectedBaseHue - H_RECENT;
+            if (Math.abs(hueDiff) > 180) { hueDiff = hueDiff > 0 ? hueDiff - 360 : hueDiff + 360; }
+            const interpolatedHue = (H_RECENT + hueDiff * factor); // Hue can be negative here, will be fixed by % 360 later
+            h_dark = interpolatedHue;
+            h_light = interpolatedHue;
+
+            // Interpolate S, L from "Very Recent" values to "Just Older" target values
+            // Dark Theme: From (H_RECENT, S85, L30) to (selectedBaseHue, S70, L25)
+            s_dark = interpolate(85, 70, factor);
+            l_dark = interpolate(30, 25, factor);
+            // Light Theme: From (H_RECENT, S85, L80) to (selectedBaseHue, S70, L85)
+            s_light = interpolate(85, 70, factor);
+            l_light = interpolate(80, 85, factor);
+
+        } else if (ageInDays < MID_AGE_TO_OLD_DAYS) { // 60 to 180 days
+            const factor = (ageInDays - RECENT_TO_MID_AGE_DAYS) / (MID_AGE_TO_OLD_DAYS - RECENT_TO_MID_AGE_DAYS);
+            // Hue is already selectedBaseHue
+            // Dark Theme: From (S70, L25) to (S50, L20)
+            s_dark = interpolate(70, 50, factor);
+            l_dark = interpolate(25, 20, factor);
+            // Light Theme: From (S70, L85) to (S50, L90)
+            s_light = interpolate(70, 50, factor);
+            l_light = interpolate(85, 90, factor);
+        } else { // > 180 days
+            // Hue is selectedBaseHue
+            // Dark Theme: (S30, L15)
+            s_dark = 30;
+            l_dark = 15;
+            // Light Theme: (S30, L95)
+            s_light = 30;
+            l_light = 95;
         }
-        const interpolatedHue = (H_RECENT + hueDiff * factor + 360) % 360;
-
-        h_final_dark = interpolatedHue;
-        h_final_light = interpolatedHue;
-
-        s_final_dark = interpolate(S_RECENT_DARK, S_OLD_DARK, factor);
-        l_final_dark = interpolate(L_RECENT_DARK, L_OLD_DARK, factor);
-
-        s_final_light = interpolate(S_RECENT_LIGHT, S_OLD_LIGHT, factor);
-        l_final_light = interpolate(L_RECENT_LIGHT, L_OLD_LIGHT, factor);
     }
 
-    // Ensure final S and L values are within the 0-100 range
-    s_final_dark = Math.max(0, Math.min(100, s_final_dark));
-    l_final_dark = Math.max(0, Math.min(100, l_final_dark));
-    s_final_light = Math.max(0, Math.min(100, s_final_light));
-    l_final_light = Math.max(0, Math.min(100, l_final_light));
+    // Normalize and Clamp S, L, H
+    s_dark = Math.max(0, Math.min(100, s_dark));
+    l_dark = Math.max(0, Math.min(100, l_dark));
+    s_light = Math.max(0, Math.min(100, s_light));
+    l_light = Math.max(0, Math.min(100, l_light));
 
-    const darkColor = `hsl(${h_final_dark.toFixed(0)}, ${s_final_dark.toFixed(0)}%, ${l_final_dark.toFixed(0)}%)`;
-    const lightColor = `hsl(${h_final_light.toFixed(0)}, ${s_final_light.toFixed(0)}%, ${l_final_light.toFixed(0)}%)`;
+    h_dark = (h_dark % 360 + 360) % 360;
+    h_light = (h_light % 360 + 360) % 360;
 
-    return { lightColor, darkColor };
+
+    const finalDarkBgColor = `hsl(${h_dark.toFixed(0)}, ${s_dark.toFixed(0)}%, ${l_dark.toFixed(0)}%)`;
+    const finalLightBgColor = `hsl(${h_light.toFixed(0)}, ${s_light.toFixed(0)}%, ${l_light.toFixed(0)}%)`;
+
+    const luminanceDarkBg = calculateLuminance(finalDarkBgColor);
+    const luminanceLightBg = calculateLuminance(finalLightBgColor);
+
+    const darkThemeTextColor = luminanceDarkBg < 0.45 ? '#FFFFFF' : '#000000';
+    const lightThemeTextColor = luminanceLightBg < 0.45 ? '#FFFFFF' : '#000000';
+
+
+    return {
+        lightColor: finalLightBgColor,
+        darkColor: finalDarkBgColor,
+        lightThemeTextColor: lightThemeTextColor,
+        darkThemeTextColor: darkThemeTextColor,
+    };
 }
 
 function buildUncommitBlame(line: number): Blame {
