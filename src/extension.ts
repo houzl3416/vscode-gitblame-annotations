@@ -708,12 +708,12 @@ function interpolateHue(h1: number, h2: number, factor: number): number {
 }
 
 const GRADIENT_CONFIG = {
-    NEWEST_DARK: { h: 45, s: 90, l: 40 },
-    NEWEST_LIGHT: { h: 45, s: 90, l: 75 },
-    OLDEST_DARK: { h: 240, s: 20, l: 20 },
-    OLDEST_LIGHT: { h: 240, s: 30, l: 90 },
-    UNCOMMITTED_DARK_BG: "hsl(0, 0%, 22%)", // Slightly off-black for dark themes
-    UNCOMMITTED_LIGHT_BG: "hsl(0, 0%, 92%)", // Slightly off-white for light themes
+    NEWEST_DARK: { h: 35, s: 100, l: 50 },    // Vibrant, saturated, bright orange
+    NEWEST_LIGHT: { h: 35, s: 95, l: 60 },   // Vibrant, saturated orange, good for light themes
+    OLDEST_DARK: { h: 220, s: 15, l: 15 },    // Very desaturated, very dark, cool blue/slate
+    OLDEST_LIGHT: { h: 220, s: 20, l: 96 },   // Very desaturated, very light, cool blue/gray
+    UNCOMMITTED_DARK_BG: "hsl(0, 0%, 30%)",    // Neutral dark gray
+    UNCOMMITTED_LIGHT_BG: "hsl(0, 0%, 90%)",   // Neutral light gray
 };
 
 function getCommitColor(commit: string, relativeAgeInFile?: number): CommitColorInfo {
